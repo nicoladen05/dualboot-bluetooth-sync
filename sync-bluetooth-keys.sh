@@ -7,6 +7,10 @@ TMP_ROOT=""
 SELECTED_MOUNT=""
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 DEBUG=0
+SYNC_DIRECTION="windows-to-linux"
+WINDOWS_HIVE_BACKUP_DONE=0
+WINDOWS_HIVE_BACKUP_PATH=""
+REGED_PREFIX="DUALBOOTBTSYNC"
 
 declare -a CANDIDATE_DEVICES=()
 declare -a CANDIDATE_FSTYPES=()
@@ -59,21 +63,35 @@ require_commands() {
     fi
   done
 
+  if [[ $SYNC_DIRECTION == "linux-to-windows" ]] && ! command -v reged >/dev/null 2>&1; then
+    missing+=("reged")
+  fi
+
   [[ ${#missing[@]} -eq 0 ]] || die "Missing required commands: ${missing[*]}"
 }
 
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case $1 in
+      --to-windows)
+        SYNC_DIRECTION="linux-to-windows"
+        shift
+        ;;
+      --to-linux)
+        SYNC_DIRECTION="windows-to-linux"
+        shift
+        ;;
       --debug)
         DEBUG=1
         shift
         ;;
       -h|--help)
         cat <<EOF
-Usage: $SCRIPT_NAME [--debug]
+Usage: $SCRIPT_NAME [--to-linux|--to-windows] [--debug]
 
 Options:
+  --to-linux  Copy Bluetooth keys from Windows into local Linux BlueZ data (default)
+  --to-windows  Copy Bluetooth keys from local Linux BlueZ data into the Windows registry
   --debug   Print extracted registry values and matching decisions
   -h, --help  Show this help message
 EOF
@@ -118,11 +136,12 @@ prompt_yes_no() {
   done
 }
 
-mount_read_only() {
+mount_partition() {
   local device=$1
   local target=$2
+  local mode=$3
 
-  mount -o ro "$device" "$target" 2>/dev/null
+  mount -o "$mode" "$device" "$target" 2>/dev/null
 }
 
 discover_windows_partitions() {
@@ -137,7 +156,7 @@ discover_windows_partitions() {
     probe_dir="$probe_root/$(basename "$device")"
     mkdir -p "$probe_dir"
 
-    if mount_read_only "$device" "$probe_dir"; then
+    if mount_partition "$device" "$probe_dir" ro; then
       if [[ -f "$probe_dir/Windows/System32/config/SYSTEM" ]]; then
         CANDIDATE_DEVICES+=("$device")
         CANDIDATE_FSTYPES+=("$fstype")
@@ -176,9 +195,15 @@ select_windows_partition() {
 
 mount_selected_partition() {
   local device=$1
+  local mode=ro
+
+  if [[ $SYNC_DIRECTION == "linux-to-windows" ]]; then
+    mode=rw
+  fi
+
   SELECTED_MOUNT=$(mktemp -d "$TMP_ROOT/windows.XXXXXX")
-  mount_read_only "$device" "$SELECTED_MOUNT" || die "Failed to mount $device read-only. If Windows Fast Startup is enabled, disable it and try again."
-  debug "Mounted $device at $SELECTED_MOUNT"
+  mount_partition "$device" "$SELECTED_MOUNT" "$mode" || die "Failed to mount $device $mode. If Windows Fast Startup is enabled, disable it and try again."
+  debug "Mounted $device at $SELECTED_MOUNT with mode $mode"
 }
 
 chntpw_run() {
@@ -257,6 +282,132 @@ value = sys.argv[1]
 raw = bytes.fromhex(value)
 print(int.from_bytes(raw, byteorder='little', signed=False))
 PY
+}
+
+hex_to_reg_binary() {
+  local hex=${1^^}
+
+  python3 - "$hex" <<'PY'
+import sys
+
+value = sys.argv[1].strip()
+if len(value) % 2 != 0:
+    raise SystemExit('invalid hex length')
+print('hex:' + ','.join(value[i:i + 2].lower() for i in range(0, len(value), 2)))
+PY
+}
+
+decimal_to_reg_dword() {
+  local value=$1
+
+  python3 - "$value" <<'PY'
+import sys
+
+value = int(sys.argv[1])
+if value < 0 or value > 0xFFFFFFFF:
+    raise SystemExit('DWORD out of range')
+print(f'dword:{value:08x}')
+PY
+}
+
+decimal_to_reg_qword() {
+  local value=$1
+
+  python3 - "$value" <<'PY'
+import sys
+
+value = int(sys.argv[1])
+if value < 0 or value > 0xFFFFFFFFFFFFFFFF:
+    raise SystemExit('QWORD out of range')
+raw = value.to_bytes(8, byteorder='little', signed=False)
+print('hex(b):' + ','.join(f'{byte:02x}' for byte in raw))
+PY
+}
+
+extract_linux_device_material() {
+  local info_file=$1
+
+  python3 - "$info_file" <<'PY'
+import configparser
+import shlex
+import sys
+
+path = sys.argv[1]
+cfg = configparser.ConfigParser(interpolation=None, strict=False)
+cfg.optionxform = str
+
+with open(path, 'r', encoding='utf-8') as handle:
+    cfg.read_file(handle)
+
+def get(section, key):
+    if cfg.has_section(section) and cfg.has_option(section, key):
+        return cfg.get(section, key).strip()
+    return ''
+
+def first_ltk_value(key):
+    for section in ('LongTermKey', 'PeripheralLongTermKey', 'SlaveLongTermKey'):
+        value = get(section, key)
+        if value:
+            return value
+    return ''
+
+values = {
+    'DEVICE_KIND': 'classic' if get('LinkKey', 'Key') else ('ble' if first_ltk_value('Key') else ''),
+    'LINK_KEY': get('LinkKey', 'Key').upper(),
+    'LTK': first_ltk_value('Key').upper(),
+    'ENC_SIZE': first_ltk_value('EncSize'),
+    'EDIV': first_ltk_value('EDiv'),
+    'RAND': first_ltk_value('Rand'),
+    'IRK': get('IdentityResolvingKey', 'Key').upper(),
+    'CSRK': get('LocalSignatureKey', 'Key').upper(),
+    'CSRK_INBOUND': get('RemoteSignatureKey', 'Key').upper(),
+}
+
+for key, value in values.items():
+    print(f'{key}={shlex.quote(value)}')
+PY
+}
+
+ensure_windows_hive_backup() {
+  local hive=$1
+  local backup_dir=/var/backups/dualboot-bluetooth-sync
+
+  (( WINDOWS_HIVE_BACKUP_DONE == 0 )) || return 0
+
+  mkdir -p "$backup_dir" || die "Failed to create backup directory $backup_dir"
+  WINDOWS_HIVE_BACKUP_PATH="$backup_dir/SYSTEM.$TIMESTAMP"
+  cp -a "$hive" "$WINDOWS_HIVE_BACKUP_PATH" || die "Failed to back up Windows SYSTEM hive to $WINDOWS_HIVE_BACKUP_PATH"
+  WINDOWS_HIVE_BACKUP_DONE=1
+  log "Backed up Windows SYSTEM hive to $WINDOWS_HIVE_BACKUP_PATH"
+}
+
+registry_import_values() {
+  local hive=$1
+  local section_key=$2
+  shift 2
+  local reg_file="$TMP_ROOT/import.$RANDOM.reg"
+  local line status
+
+  {
+    printf 'Windows Registry Editor Version 5.00\r\n\r\n'
+    printf '[%s\\%s]\r\n' "$REGED_PREFIX" "$section_key"
+    for line in "$@"; do
+      printf '%s\r\n' "$line"
+    done
+  } > "$reg_file"
+
+  debug "Importing Windows registry values into $section_key"
+  if (( DEBUG )); then
+    while IFS= read -r line; do
+      debug "$line"
+    done < "$reg_file"
+  fi
+
+  reged -N -E -I -C "$hive" "$REGED_PREFIX" "$reg_file" >/dev/null 2>&1
+  status=$?
+  rm -f "$reg_file"
+
+  [[ $status -eq 2 ]] || die "Failed to import Windows registry updates into $section_key. Re-run with --debug for details."
 }
 
 get_current_control_set() {
@@ -509,18 +660,13 @@ if kind == 'classic':
     ensure('LinkKey')
     cfg.set('LinkKey', 'Key', link_key)
 else:
-    ltk_sections = ['LongTermKey']
-    for extra in ('PeripheralLongTermKey', 'SlaveLongTermKey'):
-        if cfg.has_section(extra):
-            ltk_sections.append(extra)
-
-    for section in ltk_sections:
-        ensure(section)
-        cfg.set(section, 'Key', ltk)
-        cfg.set(section, 'EncSize', enc_size)
-        cfg.set(section, 'EDiv', ediv)
-        cfg.set(section, 'Rand', rand)
-        cfg.set(section, 'Authenticated', preserve_or_default(section, 'Authenticated', 'false'))
+    # Leave device-specific extra LTK sections intact by default.
+    ensure('LongTermKey')
+    cfg.set('LongTermKey', 'Key', ltk)
+    cfg.set('LongTermKey', 'EncSize', enc_size)
+    cfg.set('LongTermKey', 'EDiv', ediv)
+    cfg.set('LongTermKey', 'Rand', rand)
+    cfg.set('LongTermKey', 'Authenticated', preserve_or_default('LongTermKey', 'Authenticated', 'false'))
 
     if irk:
         ensure('IdentityResolvingKey')
@@ -661,6 +807,115 @@ process_windows_devices() {
   done < <(printf '%s\n' "$adapter_ls" | parse_subkeys)
 }
 
+sync_linux_classic_device_to_windows() {
+  local hive=$1
+  local adapter_path=$2
+  local windows_registry_name=$3
+  local windows_mac source_path info_file link_key reg_value
+
+  windows_mac=$(normalize_mac_nosep "$windows_registry_name")
+
+  if ! source_path=$(resolve_linux_device_path "$windows_mac"); then
+    return 0
+  fi
+
+  info_file="$source_path/info"
+  [[ -f $info_file ]] || {
+    SKIPPED_DEVICES+=("$(format_mac_colon "$windows_mac"): missing Linux info file at $info_file")
+    return 0
+  }
+
+  eval "$(extract_linux_device_material "$info_file")"
+
+  [[ $DEVICE_KIND == "classic" && $LINK_KEY =~ ^[0-9A-F]{32}$ ]] || {
+    SKIPPED_DEVICES+=("$(format_mac_colon "$windows_mac"): Linux info file does not contain a usable classic LinkKey")
+    return 0
+  }
+
+  ensure_windows_hive_backup "$hive"
+  reg_value=$(hex_to_reg_binary "$LINK_KEY") || {
+    SKIPPED_DEVICES+=("$(format_mac_colon "$windows_mac"): failed to convert Linux LinkKey for Windows registry")
+    return 0
+  }
+  registry_import_values "$hive" "$adapter_path" "\"$windows_registry_name\"=$reg_value"
+  UPDATED_DEVICES+=("$(device_label "$windows_mac"): updated Windows classic pairing key from Linux")
+}
+
+sync_linux_ble_device_to_windows() {
+  local hive=$1
+  local device_path=$2
+  local windows_registry_name=$3
+  local windows_mac source_path info_file ltk_value irk_value csrk_value csrk_inbound_value
+  local -a reg_lines=()
+
+  windows_mac=$(normalize_mac_nosep "$windows_registry_name")
+
+  if ! source_path=$(resolve_linux_device_path "$windows_mac"); then
+    return 0
+  fi
+
+  info_file="$source_path/info"
+  [[ -f $info_file ]] || {
+    SKIPPED_DEVICES+=("$(format_mac_colon "$windows_mac"): missing Linux info file at $info_file")
+    return 0
+  }
+
+  eval "$(extract_linux_device_material "$info_file")"
+
+  [[ $DEVICE_KIND == "ble" && $LTK =~ ^[0-9A-F]{32}$ && $ENC_SIZE =~ ^[0-9]+$ && $EDIV =~ ^[0-9]+$ && $RAND =~ ^[0-9]+$ ]] || {
+    SKIPPED_DEVICES+=("$(format_mac_colon "$windows_mac"): Linux info file does not contain complete BLE key material")
+    return 0
+  }
+
+  ltk_value=$(hex_to_reg_binary "$LTK")
+  reg_lines+=("\"LTK\"=$ltk_value")
+  reg_lines+=("\"KeyLength\"=$(decimal_to_reg_dword "$ENC_SIZE")")
+  reg_lines+=("\"EDIV\"=$(decimal_to_reg_dword "$EDIV")")
+  reg_lines+=("\"ERand\"=$(decimal_to_reg_qword "$RAND")")
+
+  if [[ $IRK =~ ^[0-9A-F]{32}$ ]]; then
+    irk_value=$(hex_to_reg_binary "$IRK")
+    reg_lines+=("\"IRK\"=$irk_value")
+  fi
+
+  if [[ $CSRK =~ ^[0-9A-F]{32}$ ]]; then
+    csrk_value=$(hex_to_reg_binary "$CSRK")
+    reg_lines+=("\"CSRK\"=$csrk_value")
+  fi
+
+  if [[ $CSRK_INBOUND =~ ^[0-9A-F]{32}$ ]]; then
+    csrk_inbound_value=$(hex_to_reg_binary "$CSRK_INBOUND")
+    reg_lines+=("\"CSRKInbound\"=$csrk_inbound_value")
+  fi
+
+  ensure_windows_hive_backup "$hive"
+  registry_import_values "$hive" "$device_path" "${reg_lines[@]}"
+  UPDATED_DEVICES+=("$(device_label "$windows_mac"): updated Windows BLE keys from Linux")
+}
+
+process_linux_devices_to_windows() {
+  local hive=$1
+  local adapter_path=$2
+  local adapter_ls value_name device_name_raw device_mac
+
+  adapter_ls=$(registry_ls "$hive" "$adapter_path")
+
+  while read -r value_name; do
+    [[ -n $value_name ]] || continue
+    device_mac=$(normalize_mac_nosep "$value_name")
+    if [[ $device_mac =~ ^[0-9A-F]{12}$ ]]; then
+      sync_linux_classic_device_to_windows "$hive" "$adapter_path" "$value_name"
+    fi
+  done < <(printf '%s\n' "$adapter_ls" | parse_value_names)
+
+  while read -r device_name_raw; do
+    [[ -n $device_name_raw ]] || continue
+    device_mac=$(normalize_mac_nosep "$device_name_raw")
+    [[ $device_mac =~ ^[0-9A-F]{12}$ ]] || continue
+    sync_linux_ble_device_to_windows "$hive" "$adapter_path\\$device_name_raw" "$device_name_raw"
+  done < <(printf '%s\n' "$adapter_ls" | parse_subkeys)
+}
+
 print_summary() {
   local entry
 
@@ -712,13 +967,25 @@ main() {
   adapter_path="$keys_path\\$windows_adapter"
   debug "Using Windows Bluetooth adapter: $(format_mac_colon "$windows_adapter" 2>/dev/null || printf '%s' "$windows_adapter")"
 
-  process_windows_devices "$system_hive" "$adapter_path"
+  if [[ $SYNC_DIRECTION == "linux-to-windows" ]]; then
+    process_linux_devices_to_windows "$system_hive" "$adapter_path"
+  else
+    process_windows_devices "$system_hive" "$adapter_path"
+  fi
 
   if [[ ${#UPDATED_DEVICES[@]} -gt 0 ]]; then
-    log "Restarting bluetooth.service"
-    systemctl restart bluetooth.service
+    if [[ $SYNC_DIRECTION == "linux-to-windows" ]]; then
+      log "Updated Windows registry entries"
+    else
+      log "Restarting bluetooth.service"
+      systemctl restart bluetooth.service
+    fi
   else
-    log "No devices were updated; bluetooth.service was not restarted"
+    if [[ $SYNC_DIRECTION == "linux-to-windows" ]]; then
+      log "No devices were updated; Windows registry was not modified"
+    else
+      log "No devices were updated; bluetooth.service was not restarted"
+    fi
   fi
 
   print_summary
